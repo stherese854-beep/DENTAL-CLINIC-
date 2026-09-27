@@ -1,0 +1,16 @@
+# Ignore uploaded patient files (privacy)
+uploads/*.jpg
+uploads/*.jpeg
+uploads/*.png
+uploads/*.gif
+uploads/*.pdf
+
+# Keep the uploads folder itself
+!uploads/.gitkeep
+
+# Ignore local config overrides
+config/local.php
+
+# Ignore logs and temp files
+*.log
+*.tmp

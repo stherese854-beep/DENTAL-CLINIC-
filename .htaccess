@@ -1,0 +1,23 @@
+# ============================================================
+#  Apache configuration
+# ============================================================
+
+DirectoryIndex index.php
+
+Options -Indexes +FollowSymLinks
+RewriteEngine On
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Security: block access to sensitive files
+<FilesMatch "\.(sql|log|env|toml|md|sh)$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
+
+# PHP settings
+php_flag display_errors off
+php_value upload_max_filesize 10M
+php_value post_max_size 10M
+php_value max_execution_time 60

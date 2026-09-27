@@ -1,0 +1,556 @@
+<?php
+// ============================================================
+//  APPOINTMENTS / SCHEDULE  (appointments.php)
+// ============================================================
+require_once 'config/auth.php';
+require_once 'includes/assign.php';   // dentist_match_sql() for role scoping
+require_once 'includes/mailer.php';     // confirmation / cancellation emails
+require_once 'includes/message_templates.php';  // editable message wording
+require_login(['admin','dentist','staff']);
+
+// ---------- Remove an old, finished appointment ----------
+// Cancelled and completed appointments older than a week just clutter the
+// list. Admin and staff may clear them out. The patient's own history keeps
+// nothing hidden — a deleted row is genuinely gone, so we only allow it for
+// appointments that are already settled and at least a week old.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete_appointment') {
+    if (!in_array(current_role(), ['admin','staff'])) {
+        set_flash('Only admin and staff can remove old appointments.', 'error');
+        header("Location: appointments.php"); exit;
+    }
+    $id = (int)($_POST['id'] ?? 0);
+
+    $q = $pdo->prepare(
+        "SELECT patient_name, appointment_date, status,
+                DATEDIFF(CURDATE(), appointment_date) AS days_old
+           FROM appointments WHERE id = ?"
+    );
+    $q->execute([$id]);
+    $row = $q->fetch();
+
+    if (!$row) {
+        set_flash('That appointment could not be found.', 'error');
+    } elseif ((int)$row['days_old'] < 7) {
+        set_flash('Only appointments more than a week old can be removed.', 'error');
+    } elseif (!in_array($row['status'], ['Cancelled','Completed','No-show'])) {
+        set_flash('Only cancelled, completed or missed appointments can be removed.', 'error');
+    } else {
+        $pdo->prepare("DELETE FROM appointments WHERE id = ?")->execute([$id]);
+        log_activity($pdo, 'Deleted appointment', $row['patient_name'] . ' — '
+                . date('M j, Y', strtotime($row['appointment_date'])) . ' (' . $row['status'] . ')');
+        set_flash($row['patient_name'] . "'s appointment from "
+                . date('M j, Y', strtotime($row['appointment_date'])) . ' was removed.', 'info');
+    }
+    header("Location: appointments.php" . (isset($_POST['filter']) ? "?filter=".urlencode($_POST['filter']) : "")); exit;
+}
+
+// ---------- Edit an appointment's details ----------
+// Changing the date, time, treatment or dentist here also changes what the
+// patient's printed slip shows, so the patient is emailed the new details.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'edit_appointment') {
+    $id = (int)($_POST['id'] ?? 0);
+
+    // Admin and staff may edit any appointment. A dentist may edit only the
+    // appointments of their own assigned patients — the same ownership rule
+    // used for approving and cancelling.
+    $mayEdit = in_array(current_role(), ['admin','staff']);
+    if (!$mayEdit && current_role() === 'dentist' && $id) {
+        $myName = $_SESSION['name'] ?? '';
+        $gp = [$id];
+        $g1 = dentist_match_sql('p.primary_dentist', $myName, $gp);
+        $g2 = dentist_match_sql('a.dentist',         $myName, $gp);
+        $chk = $pdo->prepare(
+            "SELECT COUNT(*) FROM appointments a
+             LEFT JOIN patients p ON a.patient_id = p.id
+             WHERE a.id = ? AND ($g1 OR $g2)"
+        );
+        $chk->execute($gp);
+        $mayEdit = ((int)$chk->fetchColumn() > 0);
+    }
+    if (!$mayEdit) {
+        set_flash('You can only edit appointments for your own patients.', 'error');
+        header("Location: appointments.php"); exit;
+    }
+
+    $newDate = trim($_POST['appointment_date'] ?? '');
+    $newTime = trim($_POST['appointment_time'] ?? '');
+    $treat   = trim($_POST['treatment'] ?? '');
+    $dent    = trim($_POST['dentist'] ?? '');
+    $note    = trim($_POST['edit_note'] ?? '');
+
+    $cur = $pdo->prepare(
+        "SELECT a.*, p.email AS patient_email
+           FROM appointments a LEFT JOIN patients p ON a.patient_id = p.id
+          WHERE a.id = ?"
+    );
+    $cur->execute([$id]);
+    $ap = $cur->fetch();
+
+    if (!$ap) {
+        set_flash('That appointment could not be found.', 'error');
+    } elseif ($newDate === '' || $newTime === '') {
+        set_flash('Please give a date and a time.', 'error');
+    } elseif (!appt_slot_is_open($pdo, $newDate, $newTime, $dent, $id)) {
+        set_flash('That slot is not available — the clinic may be closed, the dentist away, '
+                . 'or the time already taken.', 'error');
+    } else {
+        $moved = ($newDate !== $ap['appointment_date'] || $newTime !== $ap['appointment_time']);
+        $movedFrom = $moved
+            ? date('M j, Y', strtotime($ap['appointment_date'])) . ' ' . $ap['appointment_time']
+            : $ap['rescheduled_from'];
+
+        $pdo->prepare(
+            "UPDATE appointments
+                SET appointment_date=?, appointment_time=?, treatment=?, dentist=?,
+                    rescheduled_at=" . ($moved ? "NOW()" : "rescheduled_at") . ",
+                    rescheduled_from=?, reschedule_reason=?
+              WHERE id=?"
+        )->execute([$newDate, $newTime, $treat, $dent, $movedFrom, $note ?: $ap['reschedule_reason'], $id]);
+
+        // Let the patient know, since their slip is now out of date.
+        $mailNote = '';
+        if (!empty($ap['patient_email']) && mail_is_ready($pdo)) {
+            $when = date('l, F j, Y', strtotime($newDate)) . ' at ' . $newTime;
+            $cat = message_catalogue()['appointment_updated'];
+            [$subj, $body] = tpl_message($pdo, 'appointment_updated', $cat['subject'], $cat['body'], [
+                'patient'   => $ap['patient_name'],
+                'was'       => $moved ? $movedFrom : '',
+                'date'      => date('l, F j, Y', strtotime($newDate)),
+                'time'      => $newTime,
+                'treatment' => $treat,
+                'dentist'   => $dent ?: 'To be assigned',
+                'note'      => $note,
+                'clinic'    => clinic_name($pdo),
+            ]);
+            $err = '';
+            $mailNote = send_mail($pdo, $ap['patient_email'], $subj, $body, $err, 'appointment_updated')
+                      ? ' The patient was emailed the new details.'
+                      : " (The email could not be sent — $err)";
+        }
+        set_flash('Appointment updated.' . $mailNote);
+    }
+    header("Location: appointments.php" . (isset($_POST['filter']) ? "?filter=".urlencode($_POST['filter']) : "")); exit;
+}
+
+// ---------- Handle status changes (Approve / Cancel / Complete) ----------
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $id = $_POST['id'] ?? '';
+    $newStatus = $_POST['status'] ?? '';
+    $allowed = ['Confirmed','Cancelled','Completed','Pending'];
+
+    // A dentist may only change appointments that belong to their own patients.
+    $canEdit = true;
+    if (current_role() === 'dentist' && $id) {
+        $myName = $_SESSION['name'] ?? '';
+        $gp = [$id];
+        $g1 = dentist_match_sql('p.primary_dentist', $myName, $gp);
+        $g2 = dentist_match_sql('a.dentist',         $myName, $gp);
+        $chk = $pdo->prepare(
+            "SELECT COUNT(*) FROM appointments a
+             LEFT JOIN patients p ON a.patient_id = p.id
+             WHERE a.id = ? AND ($g1 OR $g2)"
+        );
+        $chk->execute($gp);
+        $canEdit = ((int)$chk->fetchColumn() > 0);
+    }
+
+    if ($id && in_array($newStatus, $allowed) && $canEdit) {
+        // Load the appointment + the patient's email so we can write to them.
+        $info = $pdo->prepare(
+            "SELECT a.*, p.email AS patient_email
+               FROM appointments a
+          LEFT JOIN patients p ON a.patient_id = p.id
+              WHERE a.id = ?"
+        );
+        $info->execute([$id]);
+        $ap = $info->fetch();
+
+        $when = $ap
+            ? date('l, F j, Y', strtotime($ap['appointment_date'])) . ' at ' . $ap['appointment_time']
+            : '';
+        $mailNote = '';
+
+        if ($newStatus === 'Confirmed') {
+            // Stamp the moment it becomes Confirmed — the patient's notification
+            // bell uses this to know the confirmation is new (and unread).
+            $pdo->prepare("UPDATE appointments SET status=?, confirmed_at=NOW() WHERE id=?")
+                ->execute([$newStatus, $id]);
+
+            // Tell the patient their booking is now final.
+            if ($ap && !empty($ap['patient_email']) && mail_is_ready($pdo)) {
+                $cat = message_catalogue()['appointment_confirmed'];
+                [$subj, $body] = tpl_message($pdo, 'appointment_confirmed', $cat['subject'], $cat['body'], [
+                    'patient'   => $ap['patient_name'],
+                    'date'      => date('l, F j, Y', strtotime($ap['appointment_date'])),
+                    'time'      => $ap['appointment_time'],
+                    'treatment' => $ap['treatment'],
+                    'dentist'   => $ap['dentist'] ?: 'To be assigned',
+                    'clinic'    => clinic_name($pdo),
+                ]);
+                $err = '';
+                $mailNote = send_mail($pdo, $ap['patient_email'], $subj, $body, $err, 'appointment_confirmed')
+                          ? ' The patient was emailed.'
+                          : " (The email could not be sent — $err)";
+            }
+
+        } elseif ($newStatus === 'Cancelled') {
+            // The clinic must say WHY. The patient sees this in their portal and
+            // receives it by email, so an appointment never just disappears.
+            $reason = trim($_POST['cancel_reason'] ?? '');
+            if ($reason === '') {
+                set_flash('Please give a reason for cancelling — the patient will be told.', 'error');
+                header("Location: appointments.php" . (isset($_POST['filter']) ? "?filter=".$_POST['filter'] : "")); exit;
+            }
+
+            $pdo->prepare(
+                "UPDATE appointments
+                    SET status=?, cancelled_at=NOW(), cancelled_by=?, cancel_reason=?
+                  WHERE id=?"
+            )->execute([$newStatus, ($_SESSION['name'] ?? 'clinic'), $reason, $id]);
+
+            if ($ap && !empty($ap['patient_email']) && mail_is_ready($pdo)) {
+                $cat = message_catalogue()['appointment_cancelled'];
+                [$subj, $body] = tpl_message($pdo, 'appointment_cancelled', $cat['subject'], $cat['body'], [
+                    'patient'   => $ap['patient_name'],
+                    'date'      => date('l, F j, Y', strtotime($ap['appointment_date'])),
+                    'time'      => $ap['appointment_time'],
+                    'treatment' => $ap['treatment'],
+                    'reason'    => $reason,
+                    'clinic'    => clinic_name($pdo),
+                ]);
+                $err = '';
+                $mailNote = send_mail($pdo, $ap['patient_email'], $subj, $body, $err, 'appointment_cancelled')
+                          ? ' The patient was emailed the reason.'
+                          : " (The email could not be sent — $err)";
+            }
+
+        } else {
+            $pdo->prepare("UPDATE appointments SET status=? WHERE id=?")->execute([$newStatus, $id]);
+        }
+        $patientLabel = $ap['patient_name'] ?? ('#' . $id);
+        log_activity($pdo, "Appointment $newStatus", $patientLabel . ($when ? " ($when)" : ''));
+        set_flash("Appointment marked as $newStatus." . $mailNote);
+    } elseif (!$canEdit) {
+        set_flash("You can only manage appointments for your own patients.", 'error');
+    }
+    header("Location: appointments.php" . (isset($_POST['filter']) ? "?filter=".$_POST['filter'] : "")); exit;
+}
+
+// ---------- Filter tabs + name search ----------
+$filter = $_GET['filter'] ?? 'All';
+$search = trim($_GET['q'] ?? '');
+
+// A dentist may only see appointments for THEIR OWN assigned patients (matched
+// through the patient's primary_dentist, or an appointment that already names
+// this dentist). Admin and staff see every appointment.
+$isDentist = (current_role() === 'dentist');
+$myName    = $_SESSION['name'] ?? '';
+
+$conds = [];
+$params = [];
+if (in_array($filter, ['Confirmed','Pending','Cancelled','Completed'])) {
+    $conds[] = "a.status = ?"; $params[] = $filter;
+}
+if ($search !== '') {
+    $conds[] = "(a.patient_name LIKE ? OR a.dentist LIKE ? OR a.treatment LIKE ?)";
+    $params[] = "%$search%"; $params[] = "%$search%"; $params[] = "%$search%";
+}
+if ($isDentist) {
+    // Match this dentist in either shape the data may use:
+    //   patients.primary_dentist -> "Dr. Ana Santos"   (full name)
+    //   appointments.dentist     -> "Dr. Santos"       (short name)
+    $dp = [];
+    $byPatient = dentist_match_sql('p.primary_dentist', $myName, $dp);
+    $byAppt    = dentist_match_sql('a.dentist',         $myName, $dp);
+    $conds[] = "($byPatient OR $byAppt)";
+    foreach ($dp as $v) $params[] = $v;
+}
+
+$sql = "SELECT a.* FROM appointments a LEFT JOIN patients p ON a.patient_id = p.id";
+if ($conds) $sql .= " WHERE " . implode(" AND ", $conds);
+$sql .= " ORDER BY a.appointment_date DESC, a.appointment_time ASC";
+$stmt = $pdo->prepare($sql);
+$stmt->execute($params);
+$appts = $stmt->fetchAll();
+
+$tabs = ['All','Confirmed','Pending','Cancelled'];
+
+$page_title = "Appointments";
+include 'includes/head.php';
+$active = 'appointments';
+?>
+<div class="app-wrap">
+    <?php include 'includes/sidebar.php'; ?>
+    <main class="main">
+        <div class="page-head">
+            <div><h1>Appointments</h1><div class="sub">Schedule management</div></div>
+            <div class="d-flex align-items-center gap-3">
+                <div class="clock"><span class="time" id="clock"></span><br><span id="clock-date"></span></div>
+                <a href="appointments.php?book=1" class="btn btn-teal">+ Book</a>
+            </div>
+        </div>
+
+        <!-- Filter tabs + search -->
+        <div class="mb-3 d-flex gap-2 flex-wrap align-items-center">
+            <?php foreach ($tabs as $t): ?>
+                <a href="appointments.php?filter=<?= $t ?><?= $search!==''?'&q='.urlencode($search):'' ?>"
+                   class="btn btn-sm <?= $filter===$t ? 'btn-dark-navy' : 'btn-light' ?>"><?= $t ?></a>
+            <?php endforeach; ?>
+            <form method="GET" class="d-flex gap-2 align-items-center ms-auto" style="flex:1;max-width:340px;min-width:200px;">
+                <input type="hidden" name="filter" value="<?= e($filter) ?>">
+                <input type="text" name="q" class="form-control form-control-sm" placeholder="🔍 Search patient, dentist, treatment..." value="<?= e($search) ?>">
+                <?php if ($search !== ''): ?><a href="appointments.php?filter=<?= e($filter) ?>" class="btn btn-sm btn-light">Clear</a><?php endif; ?>
+            </form>
+        </div>
+
+        <div class="card-box">
+            <div class="table-responsive">
+                <table class="data">
+                    <thead><tr>
+                        <th>Patient</th><th>Dentist</th><th>Date</th><th>Time</th>
+                        <th>Treatment</th><th>Status</th><th>Actions</th>
+                    </tr></thead>
+                    <tbody>
+                    <?php if (empty($appts)): ?>
+                        <tr><td colspan="7" style="text-align:center;padding:40px 12px;color:#8aa0a0;">
+                            <div style="font-size:2.4rem;margin-bottom:8px;">📅</div>
+                            <?php if ($search !== '' || $filter !== 'All'): ?>
+                                No appointments match. <a href="appointments.php" style="color:var(--teal);">Clear filters</a>
+                            <?php else: ?>
+                                No appointments yet.
+                            <?php endif; ?>
+                        </td></tr>
+                    <?php endif; ?>
+                    <?php foreach ($appts as $a): ?>
+                        <tr>
+                            <td><strong><?= e($a['patient_name']) ?></strong></td>
+                            <td><?= e($a['dentist']) ?></td>
+                            <td><?= e($a['appointment_date']) ?></td>
+                            <td class="date-blue"><?= e($a['appointment_time']) ?></td>
+                            <td><?= e($a['treatment']) ?>
+                                <?php if ($a['status'] === 'Cancelled' && !empty($a['cancel_reason'])): ?>
+                                    <br><small style="color:#8aa0a0;">
+                                        <?php if (($a['cancelled_by'] ?? '') === 'patient'): ?>
+                                            <span style="color:#c0392b;">Cancelled by patient:</span>
+                                        <?php else: ?>
+                                            <span>Cancelled by <?= e($a['cancelled_by'] ?: 'clinic') ?>:</span>
+                                        <?php endif; ?>
+                                        <em><?= e($a['cancel_reason']) ?></em>
+                                    </small>
+                                <?php endif; ?>
+                            </td>
+                            <td><span class="badge-pill b-<?= strtolower($a['status']) ?>"><?= e($a['status']) ?></span></td>
+                            <td>
+                                <div class="d-flex gap-1 align-items-center">
+                                <?php if ($a['status'] === 'Pending'): ?>
+                                    <form method="POST" class="d-inline">
+                                        <input type="hidden" name="id" value="<?= $a['id'] ?>">
+                                        <input type="hidden" name="status" value="Confirmed">
+                                        <input type="hidden" name="filter" value="<?= e($filter) ?>">
+                                        <button class="btn btn-sm icon-btn" style="background:#d7f5e3;color:#138a4e;" title="Approve">✓</button>
+                                    </form>
+                                <?php endif; ?>
+
+                                <?php if ($a['status'] !== 'Cancelled'): ?>
+                                    <button class="btn btn-sm icon-btn" style="background:#e8f0fe;color:#185FA5;"
+                                            title="Edit"
+                                            onclick='openEditAppt(<?= json_encode([
+                                                "id"        => $a["id"],
+                                                "name"      => $a["patient_name"],
+                                                "date"      => $a["appointment_date"],
+                                                "time"      => $a["appointment_time"],
+                                                "treatment" => $a["treatment"],
+                                                "dentist"   => $a["dentist"],
+                                            ], JSON_HEX_APOS | JSON_HEX_QUOT) ?>)'>✎</button>
+                                <?php endif; ?>
+
+                                <?php if ($a['status'] !== 'Cancelled'): ?>
+                                    <button type="button" class="btn btn-sm icon-btn" style="background:#fbdcdc;color:#c0392b;"
+                                            title="Cancel"
+                                            onclick='openCancelAppt(<?= json_encode([
+                                                "id"    => $a["id"],
+                                                "name"  => $a["patient_name"],
+                                                "date"  => $a["appointment_date"],
+                                                "time"  => $a["appointment_time"],
+                                                "treat" => $a["treatment"],
+                                            ], JSON_HEX_APOS | JSON_HEX_QUOT) ?>)'>✕</button>
+                                <?php endif; ?>
+
+                                <?php
+                                    $daysOld = (strtotime('today') - strtotime($a['appointment_date'])) / 86400;
+                                    $canRemove = in_array(current_role(), ['admin','staff'])
+                                              && $daysOld >= 7
+                                              && in_array($a['status'], ['Cancelled','Completed','No-show']);
+                                ?>
+                                <?php if ($canRemove): ?>
+                                    <form method="POST" class="d-inline"
+                                          onsubmit="return confirm('Remove this appointment from <?= e($a['patient_name']) ?> on <?= date('M j, Y', strtotime($a['appointment_date'])) ?>?\n\nThis cannot be undone.')">
+                                        <input type="hidden" name="action" value="delete_appointment">
+                                        <input type="hidden" name="id" value="<?= $a['id'] ?>">
+                                        <input type="hidden" name="filter" value="<?= e($filter) ?>">
+                                        <button class="btn btn-sm icon-btn" style="background:#f0f0f0;color:#8aa0a0;" title="Remove">🗑</button>
+                                    </form>
+                                <?php endif; ?>
+                                </div>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    <?php if (!$appts): ?>
+                        <tr><td colspan="7" class="text-center text-muted2 py-4">No appointments in this view.</td></tr>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+</div>
+
+<!-- ===== Cancel appointment — the reason is emailed to the patient ===== -->
+<div class="modal fade" id="cancelApptModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <form method="POST" class="modal-content" onsubmit="return validateCancelAppt()">
+      <input type="hidden" name="id" id="ca-id">
+      <input type="hidden" name="status" value="Cancelled">
+      <input type="hidden" name="filter" value="<?= e($filter) ?>">
+
+      <div class="modal-header">
+        <h5 class="modal-title">Cancel this appointment</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body">
+        <div class="card-box mb-3" style="background:#f7fafa;padding:12px 14px;">
+          <div class="text-muted2" style="font-size:.8rem;">You are cancelling</div>
+          <div style="font-weight:600;" id="ca-name"></div>
+          <div class="text-muted2" style="font-size:.82rem;" id="ca-when"></div>
+        </div>
+
+        <div class="alert" style="background:#fdeeee;border:1px solid #f0c9c9;color:#8a3d3d;font-size:.82rem;">
+          The patient will be <strong>emailed this reason</strong>, and it will appear in their
+          appointment history. Please write something they will understand.
+        </div>
+
+        <label class="field-label">Reason for cancelling</label>
+        <textarea name="cancel_reason" id="ca-reason" class="form-control mb-1" rows="3"
+                  placeholder="e.g. The dentist is unwell that day, so we cannot see you as planned."></textarea>
+        <div id="ca-warn" class="text-danger small" style="display:none;">Please give a reason — the patient is told why.</div>
+
+        <div class="mt-3">
+          <div class="text-muted2 mb-1" style="font-size:.78rem;">Or pick a common reason:</div>
+          <div class="d-flex gap-1 flex-wrap">
+            <?php foreach ([
+                'The dentist is unwell that day.',
+                'The clinic is closed for an emergency.',
+                'We need to move this to another schedule.',
+                'The equipment for this treatment is unavailable.',
+            ] as $preset): ?>
+              <button type="button" class="btn btn-sm btn-light" style="font-size:.74rem;"
+                      onclick="document.getElementById('ca-reason').value=this.textContent.trim();document.getElementById('ca-warn').style.display='none';">
+                <?= e($preset) ?>
+              </button>
+            <?php endforeach; ?>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-light" data-bs-dismiss="modal">Keep appointment</button>
+        <button class="btn" style="background:#c0392b;color:#fff;">Cancel and notify patient</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ===== Edit appointment (admin and staff) ===== -->
+<div class="modal fade" id="editApptModal" tabindex="-1">
+  <div class="modal-dialog">
+    <form method="POST" class="modal-content">
+      <input type="hidden" name="action" value="edit_appointment">
+      <input type="hidden" name="id" id="ea-id">
+      <input type="hidden" name="filter" value="<?= e($filter) ?>">
+
+      <div class="modal-header">
+        <h5 class="modal-title">Edit Appointment</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body">
+        <div class="text-muted2 mb-3" style="font-size:.85rem;">
+          Patient: <strong id="ea-name"></strong>. Changing these details also changes the
+          slip the patient prints, so they will be emailed the new information.
+        </div>
+
+        <div class="row">
+          <div class="col-md-6">
+            <label class="field-label">Date</label>
+            <input type="date" name="appointment_date" id="ea-date" class="form-control mb-3" required>
+          </div>
+          <div class="col-md-6">
+            <label class="field-label">Time</label>
+            <input name="appointment_time" id="ea-time" class="form-control mb-3" placeholder="10:00 AM" required>
+          </div>
+        </div>
+
+        <label class="field-label">Treatment</label>
+        <input name="treatment" id="ea-treatment" class="form-control mb-3">
+
+        <label class="field-label">Dentist</label>
+        <select name="dentist" id="ea-dentist" class="form-select mb-3">
+          <option value="">To be assigned</option>
+          <?php foreach ($pdo->query("SELECT name FROM users WHERE role='dentist' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN) as $dn): ?>
+            <option value="<?= e($dn) ?>"><?= e($dn) ?></option>
+          <?php endforeach; ?>
+        </select>
+
+        <label class="field-label">Note to the patient <span class="text-muted2">(optional)</span></label>
+        <textarea name="edit_note" class="form-control mb-1" rows="2"
+                  placeholder="e.g. We moved you to the morning so Dr. Lagbas can see you."></textarea>
+        <div class="text-muted2" style="font-size:.78rem;">Included in the email sent to the patient.</div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-teal">Save changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="js/app.js"></script>
+<script>
+startClock();
+
+// Fill and open the edit dialog with the appointment's current details.
+function openEditAppt(a){
+    document.getElementById('ea-id').value        = a.id;
+    document.getElementById('ea-name').textContent= a.name || '';
+    document.getElementById('ea-date').value      = a.date || '';
+    document.getElementById('ea-time').value      = a.time || '';
+    document.getElementById('ea-treatment').value = a.treatment || '';
+    document.getElementById('ea-dentist').value   = a.dentist || '';
+    new bootstrap.Modal(document.getElementById('editApptModal')).show();
+}
+
+// Cancelling must always come with a reason — the patient is told why,
+// so an appointment never simply disappears from their portal.
+function openCancelAppt(a){
+    document.getElementById('ca-id').value = a.id;
+    document.getElementById('ca-name').textContent = a.name || '';
+    var d = new Date(a.date + 'T00:00:00');
+    document.getElementById('ca-when').textContent =
+        d.toLocaleDateString(undefined,{weekday:'long',year:'numeric',month:'long',day:'numeric'})
+        + ' at ' + a.time + (a.treat ? ' · ' + a.treat : '');
+    document.getElementById('ca-reason').value = '';
+    document.getElementById('ca-warn').style.display = 'none';
+    new bootstrap.Modal(document.getElementById('cancelApptModal')).show();
+}
+
+function validateCancelAppt(){
+    var r = document.getElementById('ca-reason').value.trim();
+    if (r === '') { document.getElementById('ca-warn').style.display = 'block'; return false; }
+    return true;
+}
+</script>
+</body>
+</html>
